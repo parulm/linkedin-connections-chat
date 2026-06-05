@@ -1,6 +1,9 @@
 import csv
 import os
 import asyncio
+from dotenv import load_dotenv
+load_dotenv()
+
 from google import genai
 from google.genai import types
 from google.oauth2 import service_account

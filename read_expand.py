@@ -2,12 +2,22 @@ import os
 import sys
 import asyncio
 import readline
-from claude_agent_sdk import query, ClaudeAgentOptions, AssistantMessage, ResultMessage
+import glob
+import re
+from typing import Optional, List, Dict, Any
 
+from dotenv import load_dotenv
+load_dotenv()
+
+from langchain_anthropic import ChatAnthropic
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.tools import tool
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
+from langgraph.prebuilt import create_react_agent
+from langgraph.checkpoint.memory import MemorySaver
 
 def c(text, code):
     return f"\033[{code}m{text}\033[0m"
-
 
 async def thinking_animation():
     text = "AI is thinking"
@@ -23,31 +33,46 @@ async def thinking_animation():
             await asyncio.sleep(0.3)
         await asyncio.sleep(0.5)
 
+@tool
+def Read(file_path: str, start_line: Optional[int] = 1, end_line: Optional[int] = None) -> str:
+    """Reads a file from the disk. You can optionally specify start and end lines."""
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+            if end_line is None:
+                end_line = len(lines)
+            content = "".join(lines[start_line-1:end_line])
+            return content
+    except Exception as e:
+        return f"Error reading file {file_path}: {e}"
 
-def flush_pending_tool(pending):
-    if not pending:
-        return
-    name = pending["name"]
-    count = pending["count"]
-    files = pending["files"]
+@tool
+def Glob(pattern: str) -> List[str]:
+    """Finds files matching a glob pattern."""
+    try:
+        return glob.glob(pattern, recursive=True)
+    except Exception as e:
+        return [f"Error running glob with pattern {pattern}: {e}"]
 
-    label = c(name, "36")
-    if count > 1:
-        label += c(f" x{count}", "33")
+@tool
+def Grep(pattern: str, file_pattern: str = "*") -> str:
+    """Searches for a pattern in files matching file_pattern."""
+    results = []
+    try:
+        files = glob.glob(file_pattern, recursive=True)
+        regex = re.compile(pattern)
+        for file_path in files:
+            if os.path.isfile(file_path):
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    for i, line in enumerate(f, 1):
+                        if regex.search(line):
+                            results.append(f"{file_path}:{i}:{line.strip()}")
+        return "\n".join(results) if results else "No matches found."
+    except Exception as e:
+        return f"Error running grep: {e}"
 
-    if files:
-        details = ", ".join(
-            f"{os.path.basename(f[0])} · {f[1]} lines" for f in files[:5]
-        )
-        if len(files) > 5:
-            details += f", +{len(files) - 5} more"
-        print(f"  → {label} ({details})", flush=True)
-    else:
-        print(f"  → {label}", flush=True)
-
-
-def print_header(user_query):
-    title = "LinkedIn Connection Finder"
+def print_header(user_query, model_name):
+    title = f"LinkedIn Connection Finder ({model_name})"
     q_line = f"Query: \"{user_query}\""
     width = max(len(title), len(q_line)) + 4
     print(c(f"\n╭{'─' * width}╮", "90"))
@@ -56,102 +81,104 @@ def print_header(user_query):
     print(c(f"╰{'─' * width}╯", "90"))
     print()
 
+class AgentManager:
+    def __init__(self, model_choice: str):
+        self.tools = [Read, Glob, Grep]
+        self.memory = MemorySaver()
+        self.config = {"configurable": {"thread_id": "1"}}
+        
+        if model_choice == "1":
+            self.model_name = "Claude"
+            self.llm = ChatAnthropic(model="claude-3-5-sonnet-latest", temperature=0)
+        else:
+            self.model_name = "Gemini"
+            # LangChain Gemini provider usually expects GOOGLE_API_KEY
+            self.llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0)
+            
+        self.agent = create_react_agent(self.llm, self.tools, checkpointer=self.memory)
 
-async def run_query(prompt, show_tools=True, continue_conversation=False):
-    input_tokens = 0
-    output_tokens = 0
-    pending = None
-    seen_text = False
-
-    spinner = asyncio.create_task(thinking_animation())
-
-    async for message in query(
-        prompt=prompt,
-        options=ClaudeAgentOptions(
-            model="global.anthropic.claude-sonnet-4-6",
-            allowed_tools=["Read", "Glob", "Grep"],
-            permission_mode="bypassPermissions",
-            continue_conversation=continue_conversation,
-        ),
-    ):
-        if isinstance(message, AssistantMessage):
-            if message.usage:
-                input_tokens += getattr(message.usage, "input_tokens", 0) or 0
-                output_tokens += getattr(message.usage, "output_tokens", 0) or 0
-
-            for block in message.content:
-                if hasattr(block, "text"):
-                    if not spinner.done():
-                        spinner.cancel()
-                        sys.stdout.write("\r\033[K")
-                        sys.stdout.flush()
-                    if not seen_text and pending:
-                        flush_pending_tool(pending)
-                        pending = None
-                        print()
-                        seen_text = True
-                    print(block.text, end="", flush=True)
-
-                elif hasattr(block, "name") and show_tools:
-                    if not spinner.done():
-                        spinner.cancel()
-                        sys.stdout.write("\r\033[K")
-                        sys.stdout.flush()
-
-                    tool_name = block.name
-                    tool_input = getattr(block, "input", {})
-                    file_path = tool_input.get("file_path", "")
-
-                    if pending and pending["name"] == tool_name:
-                        pending["count"] += 1
-                        if file_path:
-                            limit = tool_input.get("limit", 0)
-                            pending["files"].append((file_path, limit or "?"))
+    async def run_query(self, prompt: str):
+        spinner = asyncio.create_task(thinking_animation())
+        seen_text = False
+        
+        # Use astream_events to get granular updates
+        async for event in self.agent.astream_events(
+            {"messages": [HumanMessage(content=prompt)]},
+            self.config,
+            version="v2"
+        ):
+            kind = event["event"]
+            
+            if kind == "on_chat_model_stream":
+                if not spinner.done():
+                    spinner.cancel()
+                    sys.stdout.write("\r\033[K")
+                    sys.stdout.flush()
+                
+                content = event["data"]["chunk"].content
+                if content:
+                    if isinstance(content, list):
+                        # Some models return list of content blocks
+                        for block in content:
+                            if isinstance(block, dict) and block.get("type") == "text":
+                                print(block["text"], end="", flush=True)
                     else:
-                        flush_pending_tool(pending)
-                        pending = {"name": tool_name, "count": 1, "files": []}
-                        if file_path:
-                            limit = tool_input.get("limit", 0)
-                            pending["files"].append((file_path, limit or "?"))
+                        print(content, end="", flush=True)
+                    seen_text = True
 
-                elif hasattr(block, "tool_use_id") and pending:
-                    content = getattr(block, "content", "")
-                    if isinstance(content, str) and pending["files"]:
-                        lines = content.count("\n")
-                        idx = len(pending["files"]) - 1
-                        path, _ = pending["files"][idx]
-                        pending["files"][idx] = (path, lines)
+            elif kind == "on_tool_start":
+                if not spinner.done():
+                    spinner.cancel()
+                    sys.stdout.write("\r\033[K")
+                    sys.stdout.flush()
+                
+                tool_name = event["name"]
+                tool_input = event["data"].get("input", {})
+                print(f"\n  → {c(tool_name, '36')} ({tool_input})", flush=True)
+                
+            elif kind == "on_tool_end":
+                pass # Optionally print tool output length
 
-        elif isinstance(message, ResultMessage):
-            if not spinner.done():
-                spinner.cancel()
-                sys.stdout.write("\r\033[K")
-                sys.stdout.flush()
-            flush_pending_tool(pending)
-            pending = None
-            print(f"\n\n{c('✓', '32')} Done ({message.subtype})")
-
-    print(f"\n{c(f'--- Tokens: input={input_tokens:,} | output={output_tokens:,} | total={input_tokens + output_tokens:,} ---', '90')}")
-    return input_tokens, output_tokens
-
+        if not spinner.done():
+            spinner.cancel()
+            sys.stdout.write("\r\033[K")
+            sys.stdout.flush()
+            
+        print(f"\n\n{c('✓', '32')} Done")
 
 async def run():
+    print(c("Choose your AI model:", "1"))
+    print(f"  {c('[1]', '33')} Anthropic Claude (3.5 Sonnet)")
+    print(f"  {c('[2]', '33')} Google Gemini (1.5 Flash)")
+    
+    choice = input(f"{c('>', '36')} ").strip()
+    if choice not in ["1", "2"]:
+        print("Invalid choice. Defaulting to Gemini.")
+        choice = "2"
+    
+    manager = AgentManager(choice)
+
     if len(sys.argv) > 1:
         user_query = " ".join(sys.argv[1:])
     else:
-        user_query = input("What are you looking for? (e.g., 'customers for my AI SaaS product', 'VCs who invest in fintech'): ").strip()
+        user_query = input("\nWhat are you looking for? (e.g., 'customers for my AI SaaS product'): ").strip()
         if not user_query:
             print("No query provided. Exiting.")
             return
 
     csv_path = os.path.abspath("Connections.csv")
+    if not os.path.exists(csv_path):
+        # Fallback to sample if real one doesn't exist for testing
+        csv_path = os.path.abspath("Connections_Sample.csv")
+
     about_dir = os.path.abspath("about")
 
     with open(csv_path, "r") as f:
         lines = f.readlines()
+        # LinkedIn CSVs often have 3 lines of notes at the top
         csv_content = "".join(lines[:1000])
 
-    print_header(user_query)
+    print_header(user_query, manager.model_name)
 
     prompt = f"""Here is a LinkedIn connections export CSV (first 3 lines are notes, data starts at line 4 with headers: First Name, Last Name, URL, Email Address, Company, Position, Connected On):
 
@@ -161,11 +188,11 @@ async def run():
 
 USER'S REQUEST: {user_query}
 
-Based on the user's request, identify the TOP 10 most relevant people from this CSV data. Do NOT use the Read tool — the data is already provided above.
+Based on the user's request, identify the TOP 10 most relevant people from this CSV data. Do NOT use the Read tool to read the CSV — the data is already provided above.
 
 Present your findings naturally — for each person, share their name, company, position, their LinkedIn URL, and why they're relevant. Always include the LinkedIn URL. Keep it concise."""
 
-    await run_query(prompt)
+    await manager.run_query(prompt)
 
     while True:
         print()
@@ -175,32 +202,29 @@ Present your findings naturally — for each person, share their name, company, 
         print(f"  {c('or type anything to ask', '90')}")
         print()
         try:
-            choice = input(f"{c('>', '36')} ").strip()
+            choice_input = input(f"{c('>', '36')} ").strip()
         except (EOFError, KeyboardInterrupt):
             break
-        if not choice or choice.lower() in ("quit", "exit", "q"):
+        if not choice_input or choice_input.lower() in ("quit", "exit", "q"):
             break
 
-        if choice == "1":
-            await run_query(
-                "Show more relevant people from the CSV beyond the ones you already listed. Give the next 10. Same format as before.",
-                continue_conversation=True,
+        if choice_input == "1":
+            await manager.run_query(
+                "Show more relevant people from the CSV beyond the ones you already listed. Give the next 10. Same format as before."
             )
-        elif choice == "2":
-            await run_query(
+        elif choice_input == "2":
+            await manager.run_query(
                 f"""For each person you already listed, do the following:
 1. Extract their LinkedIn username — it's the last path segment of their URL (e.g. "https://www.linkedin.com/in/johndoe" → "johndoe")
 2. Use the Read tool to read "{about_dir}/<username>.md" — substituting the actual username
 3. If the file doesn't exist, skip that person
 
-Based on the profile content, write a personalised conversation starter — something specific to their background, recent work, or interests that would make a warm opener. Be specific, not generic. Skip anyone whose profile file is missing.""",
-                continue_conversation=True,
+Based on the profile content, write a personalised conversation starter — something specific to their background, recent work, or interests that would make a warm opener. Be specific, not generic. Skip anyone whose profile file is missing."""
             )
         else:
-            await run_query(choice, continue_conversation=True)
+            await manager.run_query(choice_input)
 
     print(f"\n{c('Goodbye!', '90')}")
-
 
 if __name__ == "__main__":
     asyncio.run(run())
