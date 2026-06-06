@@ -92,8 +92,9 @@ class AgentManager:
             self.llm = ChatAnthropic(model="claude-3-5-sonnet-latest", temperature=0)
         else:
             self.model_name = "Gemini"
-            # LangChain Gemini provider usually expects GOOGLE_API_KEY
-            self.llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0)
+            # Mid-2026 environment: using gemini-2.5-flash
+            api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_CLOUD_API_KEY")
+            self.llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0, google_api_key=api_key)
             
         self.agent = create_react_agent(self.llm, self.tools, checkpointer=self.memory)
 

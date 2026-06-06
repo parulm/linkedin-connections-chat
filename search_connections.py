@@ -1,5 +1,6 @@
 import csv
 import os
+import sys
 import asyncio
 from dotenv import load_dotenv
 load_dotenv()
@@ -11,17 +12,27 @@ from google.oauth2 import service_account
 CONCURRENCY = 10
 MAX_RETRIES = 5
 
-credentials = service_account.Credentials.from_service_account_file(
-    "sharp-leaf-451416-r4-d77b49e95f49.json",
-    scopes=["https://www.googleapis.com/auth/cloud-platform"],
-)
+# Try to use API Key from .env first, then fallback to Service Account if needed
+api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_CLOUD_API_KEY")
 
-client = genai.Client(
-    vertexai=True,
-    project="sharp-leaf-451416-r4",
-    location="global",
-    credentials=credentials,
-)
+if api_key:
+    client = genai.Client(api_key=api_key)
+else:
+    # Fallback to service account if no API key is found
+    try:
+        credentials = service_account.Credentials.from_service_account_file(
+            "sharp-leaf-451416-r4-d77b49e95f49.json",
+            scopes=["https://www.googleapis.com/auth/cloud-platform"],
+        )
+        client = genai.Client(
+            vertexai=True,
+            project="sharp-leaf-451416-r4",
+            location="global",
+            credentials=credentials,
+        )
+    except Exception as e:
+        print(f"Error: No API key found in .env and service account file missing. {e}")
+        sys.exit(1)
 
 semaphore = asyncio.Semaphore(CONCURRENCY)
 
